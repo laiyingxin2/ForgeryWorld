@@ -1,0 +1,1 @@
+{% for message in messages %}{% for content in message['content'] | selectattr('type','equalto','image') %}{{ '<image>' }}{% endfor %}{% for content in message['content'] | selectattr('type','equalto','text') %}{{ content['text'] }}{% endfor %}{% endfor %}
