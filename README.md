@@ -245,7 +245,7 @@ composite_reward = 0.7*bypass + 0.3*skill_GOOD_ratio
 - ReasoningBank arxiv [2509.25140](https://arxiv.org/abs/2509.25140) — Google strategy-rule stream
 - Reflexion arxiv [2303.11366](https://arxiv.org/abs/2303.11366) NeurIPS 2023 — intra-rollout
 
-## 🚦 Mentor Notes for Intern (赖映鑫)
+ 
 
 See [INTERNSHIP_PLAN_LAI.md](INTERNSHIP_PLAN_LAI.md) for full 12-week plan.
 
