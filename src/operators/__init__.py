@@ -42,21 +42,22 @@ except ImportError as _e:
 try:
     from operators.local_postprocess import (
         FaceAlignOperator, JpegCompressOperator,
-        ResizeBicubicOperator, GFPGANRestoreOperator,
+        ResizeBicubicOperator, GFPGANRestoreOperator, LightingOperator,
     )
     OPERATOR_REGISTRY["face_align"] = FaceAlignOperator
     OPERATOR_REGISTRY["jpeg_85"] = JpegCompressOperator
     OPERATOR_REGISTRY["resize_bicubic"] = ResizeBicubicOperator
     OPERATOR_REGISTRY["gfpgan"] = GFPGANRestoreOperator
+    OPERATOR_REGISTRY["relight"] = LightingOperator
 except ImportError as _e:
     print(f"[operators] local_postprocess unavailable: {_e}")
 
-# ★ 2026-06-20: reenact + adv_patch real ops (LivePortrait-lite + PGD)
+# ★ 2026-06-20: reenact + adv_patch real ops (real LivePortrait + PGD)
 try:
     from operators.local_reenact_advpatch import (
-        LivePortraitLiteOperator, AdvPatchPGDOperator,
+        LivePortraitOperator, AdvPatchPGDOperator,
     )
-    OPERATOR_REGISTRY["liveportrait"] = LivePortraitLiteOperator
+    OPERATOR_REGISTRY["liveportrait"] = LivePortraitOperator
     OPERATOR_REGISTRY["adv_patch_pgd"] = AdvPatchPGDOperator
 except ImportError as _e:
     print(f"[operators] local_reenact_advpatch unavailable: {_e}")
@@ -91,6 +92,21 @@ try:
     OPERATOR_REGISTRY["png_palette"] = PalettePNGOp
 except ImportError as _e:
     print(f"[operators] local_methods_bulk unavailable: {_e}")
+
+# ★ 2026-06-24: diffusion ID/synthesis/edit operators (image-only forgery family).
+# Run in the ISOLATED forgery_img conda env via subprocess; weights already on disk
+# (SDXL base, SD1.5 base, InstructPix2Pix, IP-Adapter plus-face, InstantID).
+try:
+    from operators.local_id_diffusion import (
+        InstructPix2PixOperator, IPAdapterFaceOperator,
+        SDXLSynthOperator, InstantIDOperator,
+    )
+    OPERATOR_REGISTRY["instructpix2pix"] = InstructPix2PixOperator
+    OPERATOR_REGISTRY["ipadapter_face"] = IPAdapterFaceOperator
+    OPERATOR_REGISTRY["sdxl_t2i"] = SDXLSynthOperator
+    OPERATOR_REGISTRY["instantid"] = InstantIDOperator
+except ImportError as _e:
+    print(f"[operators] local_id_diffusion unavailable: {_e}")
 
 # ★ 2026-06-20 fix: legacy/phantom op names → real registry keys. Seed libraries,
 # MCTS mutation maps, brief_hints and persisted DB chains across the codebase still

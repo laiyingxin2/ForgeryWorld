@@ -136,6 +136,11 @@ def main():
     ap.add_argument("--guard-real-floor", type=float, default=0.80)
     ap.add_argument("--guard-real-frac", type=float, default=0.25)
     ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--preset", choices=["w1_cheap", "w6_full"], default="w1_cheap",
+                    help="L2 fan-out preset for the attacker lineages (cheap=all flash).")
+    ap.add_argument("--detector-base", default=None,
+                    help="train LoRA on THIS base instead of the strong FakeVLM ckpt "
+                         "(weak-start: pass the vanilla llava the served endpoint uses).")
     args = ap.parse_args()
 
     args.out = os.path.abspath(args.out)
@@ -170,13 +175,20 @@ def main():
         # 1. all lineages attack D_R in parallel (shared endpoint; distinct out dirs)
         procs = []
         for k, lin in enumerate(lineages):
-            cmd = [args.py, "orchestrator.py", "--mode", "v2", "--rounds", "1",
+            cmd = [args.py, "legacy/orchestrator.py", "--mode", "v2", "--rounds", "1",
                    "--briefs", str(args.briefs), "--rollouts", str(args.rollouts),
-                   "--multi-agent-preset", "w6_full",
+                   "--multi-agent-preset", args.preset,
                    "--tier2-backend", "fakevlm_local", "--fakevlm-endpoint", args.endpoint,
                    "--src-pool", *args.src_pool, "--out", str(lin)]
             lg = open(coevo / f"attacker_r{R}_lin{k}.log", "w")
-            p = subprocess.Popen(cmd, cwd=str(proj / "src"), stdout=lg, stderr=subprocess.STDOUT)
+            # orchestrator.py imports siblings from BOTH src/ (viviai_client) and
+            # src/legacy/ (trajectory_schema); give it an absolute PYTHONPATH for both.
+            att_env = dict(os.environ)
+            _pp = os.pathsep.join([str(proj / "src"), str(proj / "src" / "legacy")])
+            att_env["PYTHONPATH"] = (_pp + os.pathsep + att_env["PYTHONPATH"]
+                                     if att_env.get("PYTHONPATH") else _pp)
+            p = subprocess.Popen(cmd, cwd=str(proj / "src"), stdout=lg,
+                                 stderr=subprocess.STDOUT, env=att_env)
             procs.append((k, p, lg))
             log(f"  lineage {k}: orchestrator launched (pid {p.pid})")
         for k, p, lg in procs:
@@ -263,6 +275,8 @@ def main():
         tcmd = [args.py, str(coevo_scripts / "train_defender_round.py"),
                 "--data", str(train_data), "--out", str(out_lora),
                 "--epochs", str(args.epochs), "--device", "cuda:0"]
+        if args.detector_base:
+            tcmd += ["--base", args.detector_base]
         if prev_lora:
             tcmd += ["--prev-lora", str(prev_lora)]
         tlog = open(coevo / f"train_r{R}.log", "w")

@@ -112,10 +112,12 @@ class VideoWeaverSkills:
 
     def get_top_compositions(self, family: str, top_k: int = 3,
                               min_uses: int = 1) -> list[dict]:
+        # Rank by Beta-smoothed rate (n_success+1)/(n_uses+2) so a lucky 1/1 doesn't
+        # outrank a robust 9/10 — same posterior-mean prior used across the codebase.
         cur = self.conn.execute(
             "SELECT comp_id, chain_shape, n_uses, n_success, success_rate, rationale "
             "FROM composition_skills WHERE family=? AND n_uses>=? "
-            "ORDER BY success_rate DESC, n_uses DESC LIMIT ?",
+            "ORDER BY (n_success + 1.0)/(n_uses + 2.0) DESC, n_uses DESC LIMIT ?",
             (family, min_uses, top_k))
         return [{"comp_id": r[0], "chain_shape": json.loads(r[1]),
                  "n_uses": r[2], "n_success": r[3],
@@ -159,7 +161,7 @@ class VideoWeaverSkills:
             "SELECT creator_id, recommended_params, n_uses, n_success, "
             "success_rate, rationale FROM creator_skills "
             "WHERE family=? AND op_name=? AND n_uses>=? "
-            "ORDER BY success_rate DESC, n_uses DESC LIMIT ?",
+            "ORDER BY (n_success + 1.0)/(n_uses + 2.0) DESC, n_uses DESC LIMIT ?",
             (family, op_name, min_uses, top_k))
         return [{"creator_id": r[0], "params": json.loads(r[1]),
                  "n_uses": r[2], "n_success": r[3],
@@ -180,7 +182,8 @@ class VideoWeaverSkills:
         for step in chain:
             op = step.get("tool", "?")
             params = step.get("params", {}) or {}
-            if not params: continue   # skip ops with no params (face_align etc.)
+            # Record EVERY op (incl. default/empty params) so we accumulate per-op
+            # success stats; empty params canonicalize to "{}" = "op with defaults".
             cid = self.update_creator(family, op, params, success, rationale)
             creator_ids.append(cid)
         return {"comp_id": comp_id, "creator_ids": creator_ids}

@@ -41,14 +41,23 @@ CREATE TABLE IF NOT EXISTS seed_chains (
     consecutive_failures INTEGER DEFAULT 0,
     generation INTEGER DEFAULT 0,
     parent_chain_id TEXT DEFAULT '',
-    status TEXT DEFAULT 'active',      -- active | silent
-    source TEXT DEFAULT 'mcts',        -- mcts | brief | bootstrap
+    status TEXT DEFAULT 'active',      -- active | candidate | silent
+    source TEXT DEFAULT 'mcts',        -- mcts | brief | bootstrap | external_intel | ...
     created_at REAL,
     updated_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_seed_family_status ON seed_chains (family, status);
 CREATE INDEX IF NOT EXISTS idx_seed_score ON seed_chains (weighted_score DESC);
 """
+
+
+# Voyager principle: only VERIFIED skills enter the active library. Chains from
+# these "invented"/unproven sources enter as 'candidate' (explorable at the tail
+# of the ranking) and auto-promote to 'active' on their first real sandbox bypass.
+# Designed seed corpus (mcts/bootstrap/brief) and sandbox_verified stay 'active'.
+UNVERIFIED_SOURCES = frozenset({
+    "external_intel", "llm", "llm_invented", "supervisor", "ui_voyager_correction",
+})
 
 
 def _chain_key(family: str, chain: list) -> str:
@@ -109,9 +118,16 @@ class SimpleSeedLibrary:
 
     def promote_chain(self, family: str, chain: list,
                        four_dim: dict, source: str = "mcts",
-                       parent_chain_id: str = "") -> Optional[str]:
+                       parent_chain_id: str = "", verified: bool = False) -> Optional[str]:
         """High-score chain auto-入库 (P0-3).
-        Returns chain_id if added, None if dedup'd."""
+        Returns chain_id if added, None if dedup'd.
+
+        Unverified/invented sources (see UNVERIFIED_SOURCES) enter as 'candidate'
+        and only become 'active' after record_attempt logs a real sandbox success.
+        Pass verified=True (or source='sandbox_verified') to enter 'active' directly.
+        """
+        is_active = verified or source == "sandbox_verified" or source not in UNVERIFIED_SOURCES
+        init_status = "active" if is_active else "candidate"
         chain_str = " → ".join(s.get("tool", "?") for s in chain)
         chain_id = _chain_key(family, chain)
         # exact-key existing?
@@ -144,14 +160,14 @@ class SimpleSeedLibrary:
             "INSERT INTO seed_chains (chain_id, family, chain_json, chain_str, "
             "attack_success, coverage, generalization, defense_evasion, weighted_score, "
             "generation, parent_chain_id, source, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (chain_id, family, json.dumps(chain, ensure_ascii=False), chain_str,
              float(four_dim.get("attack_success", 0)),
              float(four_dim.get("coverage", 0)),
              float(four_dim.get("generalization", 0)),
              float(four_dim.get("defense_evasion", 0)),
              float(four_dim.get("weighted", 0)),
-             gen, parent_chain_id, source, now, now))
+             gen, parent_chain_id, source, init_status, now, now))
         self.conn.commit()
         if self.chroma_col is not None:
             try:
@@ -163,11 +179,18 @@ class SimpleSeedLibrary:
 
     # ──────── 出库 ────────
     def get_top_seeds(self, family: str, top_k: int = 5) -> list[dict]:
-        """高分回池: 下一轮 MCTS seed 优先抽 top-k."""
+        """高分回池: 下一轮 MCTS seed 优先抽 top-k.
+
+        Ranking prefers REAL sandbox-verified chains (sandbox_success_count) over
+        proxy-only weighted_score, so exploitation latches onto chains that
+        actually bypassed the detector rather than ones the LLM judge merely liked.
+        """
         cur = self.conn.execute(
             "SELECT chain_id, chain_json, weighted_score, attack_success, coverage, "
             "generalization, defense_evasion, generation FROM seed_chains "
-            "WHERE family=? AND status='active' ORDER BY weighted_score DESC LIMIT ?",
+            "WHERE family=? AND status IN ('active','candidate') "
+            "ORDER BY (status='active') DESC, sandbox_success_count DESC, "
+            "weighted_score DESC LIMIT ?",
             (family, top_k))
         out = []
         for row in cur.fetchall():
@@ -200,7 +223,7 @@ class SimpleSeedLibrary:
     # ──────── 记录尝试 + 淘汰 ────────
     def record_attempt(self, chain_id: str, success: bool, score: float = 0.0) -> None:
         cur = self.conn.execute(
-            "SELECT sandbox_trial_count, sandbox_success_count, consecutive_failures "
+            "SELECT sandbox_trial_count, sandbox_success_count, consecutive_failures, status "
             "FROM seed_chains WHERE chain_id=?", (chain_id,))
         row = cur.fetchone()
         if row is None:
@@ -208,11 +231,15 @@ class SimpleSeedLibrary:
         trials = int(row[0]) + 1
         successes = int(row[1]) + (1 if success else 0)
         cons_fail = 0 if success else int(row[2]) + 1
+        # Voyager gate: a 'candidate' graduates to 'active' on its first real bypass.
+        new_status = "active" if (success and row[3] == "candidate") else row[3]
         self.conn.execute(
             "UPDATE seed_chains SET sandbox_trial_count=?, sandbox_success_count=?, "
-            "consecutive_failures=?, updated_at=? WHERE chain_id=?",
-            (trials, successes, cons_fail, time.time(), chain_id))
+            "consecutive_failures=?, status=?, updated_at=? WHERE chain_id=?",
+            (trials, successes, cons_fail, new_status, time.time(), chain_id))
         self.conn.commit()
+        if new_status == "active" and row[3] == "candidate":
+            _log.info(f"[seed_library] candidate→active (sandbox-verified): {chain_id}")
 
     def prune(self) -> list[str]:
         """淘汰低分: consecutive_failures ≥ threshold → status='silent'.

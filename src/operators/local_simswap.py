@@ -98,12 +98,14 @@ class LocalSimSwapOperator(ApiImageOperator):
         return resized, np.array([x1, y1, x2, y2])
 
     def _arcface_embed(self, face_112_bgr: np.ndarray) -> np.ndarray:
-        # input expected as 1×3×112×112 float32 in [-1, 1] (BGR)
-        x = face_112_bgr.astype(np.float32)
+        # SimSwap's ArcFace wants 1×3×112×112 float32 in [-1, 1], RGB order.
+        x = face_112_bgr[:, :, ::-1].astype(np.float32)  # BGR -> RGB
         x = (x - 127.5) / 127.5
-        x = np.transpose(x, (2, 0, 1))[None]
+        x = np.transpose(x, (2, 0, 1))[None].copy()
         emb = self._arc_sess.run(None, {self._arc_sess.get_inputs()[0].name: x})[0]
-        return emb.astype(np.float32)
+        emb = emb.astype(np.float32)
+        emb /= (np.linalg.norm(emb) + 1e-8)  # unit id vector — SimSwap expects normalized
+        return emb
 
     def run(self, src_face_path: Optional[str] = None,
              tgt_face_path: Optional[str] = None,
@@ -134,34 +136,43 @@ class LocalSimSwapOperator(ApiImageOperator):
                 return OperatorResult(success=False,
                     error=f"no face (src={len(src_faces)} tgt={len(tgt_faces)})",
                     duration_sec=time.time() - t0, model_used=self.model_id)
-            # src 112-crop for ArcFace
-            src_112, _ = self._align_face_to_size(src_bgr, src_faces[0].bbox, 112)
-            if src_112 is None:
-                return OperatorResult(success=False, error="src crop empty",
-                                       duration_sec=time.time() - t0, model_used=self.model_id)
+            # src 112 for ArcFace — use 5-point ALIGNED crop (norm_crop), not a loose
+            # bbox resize. A mis-framed crop yields a degraded id embedding and the
+            # swap fails to carry the source identity (arc≈0.15).
+            from insightface.utils import face_align
+            src_112 = face_align.norm_crop(src_bgr, src_faces[0].kps, image_size=112)
             src_emb = self._arcface_embed(src_112)
-            # tgt 256-crop
-            tgt_256, place = self._align_face_to_size(tgt_bgr, tgt_faces[0].bbox, 256)
-            if tgt_256 is None:
-                return OperatorResult(success=False, error="tgt crop empty",
-                                       duration_sec=time.time() - t0, model_used=self.model_id)
-            # SimSwap inference: input is BGR 256 [-1, 1]
-            tgt_in = tgt_256.astype(np.float32)
+            # tgt: 5-point ALIGNED 256 crop + the affine M (image -> aligned frame).
+            # SimSwap's generator works in this aligned frame; warping its output back
+            # with inverse(M) (instead of a loose bbox paste) matches the result to the
+            # target's actual face geometry → far stronger identity transfer.
+            M = face_align.estimate_norm(tgt_faces[0].kps, image_size=256)
+            tgt_256 = cv2.warpAffine(tgt_bgr, M, (256, 256), borderValue=0.0)
+            # SimSwap inference: target input is RGB 256, normalized to [-1, 1].
+            tgt_in = tgt_256[:, :, ::-1].astype(np.float32)  # BGR -> RGB
             tgt_in = (tgt_in - 127.5) / 127.5
-            tgt_in = np.transpose(tgt_in, (2, 0, 1))[None]
+            tgt_in = np.transpose(tgt_in, (2, 0, 1))[None].copy()
             in0 = self._swap_sess.get_inputs()[0].name
             in1 = self._swap_sess.get_inputs()[1].name
             swapped = self._swap_sess.run(None, {in0: tgt_in, in1: src_emb})[0]
-            # back to uint8 BGR
-            swap_img = np.clip((swapped[0].transpose(1, 2, 0) * 127.5 + 127.5),
-                                0, 255).astype(np.uint8)
-            # paste back
-            x1, y1, x2, y2 = place
-            crop_h, crop_w = (y2 - y1), (x2 - x1)
-            swap_resized = cv2.resize(swap_img, (crop_w, crop_h),
-                                       interpolation=cv2.INTER_LANCZOS4)
-            out = tgt_bgr.copy()
-            out[y1:y2, x1:x2] = swap_resized
+            # SimSwap output is RGB in [0, 1] (NOT [-1, 1]); decode accordingly.
+            swap_rgb = np.clip(swapped[0].transpose(1, 2, 0) * 255.0,
+                               0, 255).astype(np.uint8)
+            swap_img = swap_rgb[:, :, ::-1]  # RGB -> BGR for cv2
+            # warp the swapped 256 face back into the original image with inverse(M),
+            # blended through a feathered elliptical mask (no rectangular seam).
+            h, w = tgt_bgr.shape[:2]
+            IM = cv2.invertAffineTransform(M)
+            warped = cv2.warpAffine(swap_img, IM, (w, h),
+                                    borderMode=cv2.BORDER_REPLICATE)
+            face_mask = np.zeros((256, 256), np.float32)
+            cv2.ellipse(face_mask, (128, 128), (int(128 * 0.86), int(128 * 0.96)),
+                        0, 0, 360, 1.0, -1)
+            mask = cv2.warpAffine(face_mask, IM, (w, h), borderValue=0.0)
+            k = max(3, (min(h, w) // 30) | 1)  # odd kernel
+            mask = cv2.GaussianBlur(mask, (k, k), 0)[:, :, None]
+            out = (warped.astype(np.float32) * mask +
+                   tgt_bgr.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
             out_path = self.out_dir / f"{self.name}_{uuid.uuid4().hex[:8]}.png"
             cv2.imwrite(str(out_path), out)
             return OperatorResult(

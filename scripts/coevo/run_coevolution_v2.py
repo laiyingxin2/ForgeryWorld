@@ -64,6 +64,8 @@ def main():
                     help="train LoRA on THIS base instead of the strong FakeVLM ckpt "
                          "(weak-start: pass the vanilla llava the :8006 server serves so "
                          "the adapter composes on the naive detector). Default = strong ckpt.")
+    ap.add_argument("--preset", choices=["w1_cheap", "w6_full"], default="w1_cheap",
+                    help="L2 fan-out preset for the attacker orchestrator (cheap=all flash).")
     args = ap.parse_args()
 
     args.out = os.path.abspath(args.out)
@@ -93,7 +95,7 @@ def main():
         # 1. attacker round vs the CURRENT (possibly frozen-by-throttle) detector
         cmd = [args.py, "orchestrator.py", "--mode", "v2", "--rounds", "1",
                "--briefs", str(args.briefs), "--rollouts", str(args.rollouts),
-               "--multi-agent-preset", "w6_full",
+               "--multi-agent-preset", args.preset,
                "--tier2-backend", "fakevlm_local", "--fakevlm-endpoint", args.endpoint,
                "--src-pool", *args.src_pool, "--out", str(m3)]
         runlog = open(coevo / f"attacker_r{R}.log", "w")

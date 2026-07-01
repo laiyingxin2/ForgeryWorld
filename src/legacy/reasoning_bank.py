@@ -37,6 +37,7 @@ import numpy as np
 
 from viviai_client import ViviClient
 from ace_skill_lib import _simple_text_features, cosine_sim
+from embed_util import wmr_score
 
 
 _log = logging.getLogger(__name__)
@@ -215,12 +216,28 @@ class ReasoningBank:
         # 删除低 utility & 老旧
         self.rules[family] = rules[excess:]
 
-    def retrieve(self, family: str, query_state_desc: str, top_k: int = 3) -> list[ReasoningRule]:
-        """Cosine-similarity retrieve top-k rules for current state."""
+    def retrieve(self, family: str, query_state_desc: str, top_k: int = 3,
+                 current_round: int = 0) -> list[ReasoningRule]:
+        """WMR retrieve: semantic relevance × recency × success importance.
+
+        ReasoningBank distills rules from success AND failure; at retrieval we
+        prefer success-derived, recently-used rules but never zero out a strongly
+        relevant failure-rule (additive WMR), so the agent can still learn 'avoid X'.
+        """
         if family not in self.rules or not self.rules[family]:
             return []
         q_emb = _simple_text_features(query_state_desc)
-        scored = [(cosine_sim(q_emb, r.trigger_emb), r) for r in self.rules[family]]
+        scored = []
+        for r in self.rules[family]:
+            rel = cosine_sim(q_emb, r.trigger_emb)
+            score = wmr_score(
+                rel,
+                last_used_round=r.source_round,
+                current_round=current_round or r.source_round,
+                alpha_count=1.0 if r.success_label else 0.0,
+                beta_count=0.0 if r.success_label else 1.0,
+            )
+            scored.append((score, r))
         scored.sort(reverse=True, key=lambda x: x[0])
         top = [r for _, r in scored[:top_k]]
         # bump utility on retrieved (ReMe utility pattern)

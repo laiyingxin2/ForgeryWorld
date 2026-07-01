@@ -66,6 +66,30 @@ except ImportError:
 _log = logging.getLogger(__name__)
 
 
+def _soft_evade_score(tier1: dict) -> float:
+    """连续 bypass-proximity ∈ [0,1]: 越像"骗过 FakeVLM"越高.
+
+    FakeVLM 只给二值标签(无 confidence), 故无法直接拿检测器连续信号.
+    这里用 tier1 反取证代理, 对准 FakeVLM 自述的失败模式
+    ("skin too smooth / lacks texture / unnatural / misaligned features"):
+      - fft_artifact_score 低  → 频域伪影少
+      - landmark_consistency 高 → 五官对齐自然(非 misaligned mouths)
+      - maniqa(TV proxy)高    → 纹理/细节多(非 overly smooth)
+      - niqe(BRISQUE)低       → 自然度高
+    纯启发式: 目的是在 bypass=0 时给搜索一个平滑梯度, 非校准指标.
+    """
+    if not isinstance(tier1, dict) or tier1.get("error"):
+        return 0.0
+    def clip01(x):
+        try: return max(0.0, min(1.0, float(x)))
+        except Exception: return 0.0
+    fft  = clip01(1.0 - float(tier1.get("fft_artifact_score", 1.0)))
+    lmk  = clip01(tier1.get("landmark_consistency", 0.0))
+    tex  = clip01(float(tier1.get("maniqa", 0.0)) / 100.0)
+    niqe = clip01(1.0 - float(tier1.get("niqe", 100.0)) / 100.0)
+    return 0.35 * fft + 0.25 * lmk + 0.20 * tex + 0.20 * niqe
+
+
 # ────────────────────────── Config ──────────────────────────────────
 
 @dataclass
@@ -75,6 +99,13 @@ class OrchestratorConfig:
     n_briefs_per_round: int = 4
     n_rollouts_per_brief: int = 2
     output_dir: str = "outputs"
+    # ★ Long-horizon (长程) persistence: a SHARED bank dir for cross-scenario skill/
+    # markov/reasoning accumulation (Voyager fixed-ckpt pattern). Empty → falls back to
+    # output_dir (legacy per-run behavior). When set, the evolutionary bank (markov,
+    # skills_v1/v2, reasoning_bank, novelty, family_agents, op_health, seed libs,
+    # videoweaver, meta-state, coevo snapshots) loads/saves here while trajectories /
+    # reports / data_flow / memory stay per-scenario in output_dir.
+    bank_dir: str = ""
     seed: int = 42
 
     # tier-2 model (sandbox.py)
@@ -123,6 +154,9 @@ class OrchestratorConfig:
     enable_reasoning_bank: bool = True  # 平行 strategy-rule 流
     enable_novelty: bool = True         # 反 mode collapse novelty term
     reflexion_max_per_rollout: int = 2  # 限制省钱
+    # ★ 连续 bypass-proximity 奖励: 二值 bypass=0 时给搜索一个朝"反检测"爬的梯度
+    # (FakeVLM 只给二值标签, 无连续 confidence; 用 tier1 反取证代理对准其失败模式)
+    evade_shaping_weight: float = 0.3   # 0 = 关闭(回退旧二值行为)
 
     # ★ search finding #2 修: cost budget guard ($47K stall loop)
     cost_budget_usd: float = 5.0        # 单次 orchestrator.run 硬上限
@@ -156,11 +190,16 @@ class Orchestrator:
 
         # output dirs
         self.out_dir = Path(cfg.output_dir)
+        # ★ Long-horizon bank dir (Voyager fixed-ckpt). Shared across outer scenarios so
+        # the evolutionary bank accumulates instead of cold-starting each scenario.
+        self.bank_dir = Path(cfg.bank_dir) if cfg.bank_dir else self.out_dir
         (self.out_dir / "trajectories").mkdir(parents=True, exist_ok=True)
         (self.out_dir / "skills").mkdir(parents=True, exist_ok=True)
-        (self.out_dir / "markov").mkdir(parents=True, exist_ok=True)
+        (self.bank_dir / "markov").mkdir(parents=True, exist_ok=True)
         (self.out_dir / "reports").mkdir(parents=True, exist_ok=True)
         (self.out_dir / "face_attack_outputs").mkdir(parents=True, exist_ok=True)
+        if self.bank_dir != self.out_dir:
+            _log.info(f"[bank] long-horizon shared bank_dir = {self.bank_dir}")
 
         # viviai client (single shared)
         import os
@@ -186,7 +225,7 @@ class Orchestrator:
         # 每个 family 独立 system prompt + 跨 round 经验日志
         from family_attack_agents import FamilyAttackAgentPool
         self.family_agents = FamilyAttackAgentPool(
-            base_dir=str(self.out_dir / "family_agents"),
+            base_dir=str(self.bank_dir / "family_agents"),
         )
         agent_loaded_stats = self.family_agents.stats()
         loaded_count = sum(1 for s in agent_loaded_stats.values() if s["attempts"] > 0)
@@ -199,7 +238,7 @@ class Orchestrator:
             try:
                 from videoweaver_skills import VideoWeaverSkills
                 self.videoweaver_skills = VideoWeaverSkills(
-                    db_path=str(self.out_dir / "videoweaver_skills" / "skills.db"),
+                    db_path=str(self.bank_dir / "videoweaver_skills" / "skills.db"),
                 )
             except Exception as e:
                 _log.warning(f"[videoweaver] init failed: {e}")
@@ -210,7 +249,7 @@ class Orchestrator:
         if getattr(cfg, "enable_method3_coevolution", True):
             try:
                 from method3_coevolution import CoEvolutionLoop
-                coevo_dir = str(self.out_dir / "coevo_snapshots")
+                coevo_dir = str(self.bank_dir / "coevo_snapshots")
                 self.coevo = CoEvolutionLoop.load_latest(
                     out_dir=coevo_dir,
                     vllm_endpoint=cfg.fakevlm_endpoint,
@@ -233,7 +272,7 @@ class Orchestrator:
         # Baseline-specific layers
         if cfg.baseline_mode == "v2":
             # BUG B 修: Markov 矩阵跨 run 持久化
-            markov_path = self.out_dir / "markov" / "markov_state.json"
+            markov_path = self.bank_dir / "markov" / "markov_state.json"
             if cfg.persist_skills_across_runs and markov_path.exists():
                 self.family_selector = MarkovFamilySelector.load(str(markov_path))
                 _log.info(f"[markov] loaded from {markov_path}, "
@@ -244,7 +283,7 @@ class Orchestrator:
             self.skill_lib = SkillLibrary(
                 families=self.families, config=AceSkillConfig(),
                 client=self.client,
-                base_dir=str(self.out_dir / "skills_v2"),
+                base_dir=str(self.bank_dir / "skills_v2"),
             )
             # 关键: 跨 run 累积 skill, init 时 load
             if cfg.persist_skills_across_runs:
@@ -269,19 +308,19 @@ class Orchestrator:
             )
             self.reasoning_bank = (
                 ReasoningBank(families=self.families, client=self.client,
-                              base_dir=str(self.out_dir / "reasoning_bank"))
+                              base_dir=str(self.bank_dir / "reasoning_bank"))
                 if cfg.enable_reasoning_bank else None
             )
             self.novelty = (
                 NoveltyTracker(
                     config=NoveltyConfig(K_history=64, novelty_weight=0.4),
-                    persist_path=str(self.out_dir / "novelty_history.json"),
+                    persist_path=str(self.bank_dir / "novelty_history.json"),
                 ) if cfg.enable_novelty else None
             )
         else:  # v1
             # ★ TIER1-M1-3: method 1 也用 Markov+Q-Learning (内部文章图2)
             if cfg.v1_use_markov:
-                markov_path = self.out_dir / "markov" / "markov_state_v1.json"
+                markov_path = self.bank_dir / "markov" / "markov_state_v1.json"
                 if cfg.persist_skills_across_runs and markov_path.exists():
                     self.family_selector = MarkovFamilySelector.load(str(markov_path))
                     _log.info(f"[markov-v1] loaded from {markov_path}, "
@@ -293,7 +332,7 @@ class Orchestrator:
                 self.family_selector = SimpleFamilySelector(families=self.families)
             self.skill_book_v1 = SimpleSkillBook(
                 families=self.families,
-                base_dir=str(self.out_dir / "skills_v1"),
+                base_dir=str(self.bank_dir / "skills_v1"),
             )
             # ★ BUG-V1A 修: v1 也跨 run 累积 skill (用户问 "方法 1 没问题吗")
             if cfg.persist_skills_across_runs:
@@ -306,7 +345,7 @@ class Orchestrator:
             if cfg.v1_use_seed_library:
                 from simple_seed_library import SimpleSeedLibrary
                 self.seed_library_v1 = SimpleSeedLibrary(
-                    db_path=str(self.out_dir / "seed_library_v1" / "seeds.db"),
+                    db_path=str(self.bank_dir / "seed_library_v1" / "seeds.db"),
                 )
                 stats = self.seed_library_v1.stats()
                 _log.info(f"[seed_library_v1] loaded: {stats}")
@@ -321,7 +360,7 @@ class Orchestrator:
         if not hasattr(self, 'op_health'):
             self.op_health = OpHealthTracker(
                 window_per_op=20, min_calls_for_stats=1,
-                persist_path=str(self.out_dir / "op_health.json"),
+                persist_path=str(self.bank_dir / "op_health.json"),
             )
 
         # Attack operators (API only for prototype — local ones need install)
@@ -387,7 +426,7 @@ class Orchestrator:
             self.mem.register_l3_view("reasoning_bank", self.reasoning_bank)
 
         # BUG E 修: recent_briefs/outcomes 跨 run 持久化
-        self._meta_state_path = self.out_dir / "orchestrator_meta.json"
+        self._meta_state_path = self.bank_dir / "orchestrator_meta.json"
         self.recent_briefs: list[Brief] = []
         self.recent_outcomes: list[dict] = []
         self.total_cost = 0.0  # BUG F 修: 累计成本跨 run
@@ -546,11 +585,13 @@ class Orchestrator:
                     else "")
 
         # ── Layer 3: skill retrieve (v2) or get doc (v1) ──
+        injected_meta_names: list[str] = []   # L4 meta-skills shown to setter this rollout
         if self.cfg.baseline_mode == "v2":
             skill_doc, top_exps = self.skill_lib.retrieve(
                 family_name,
                 query=f"how to bypass detector for {family_name}",
                 top_k=5,
+                current_round=round_id,
             )
             # ★ Q4: ReasoningBank retrieve top-3 rules, 注入 brief 上下文
             if self.reasoning_bank:
@@ -558,6 +599,7 @@ class Orchestrator:
                     family_name,
                     query_state_desc=f"face KYC attack on {family_name}",
                     top_k=3,
+                    current_round=round_id,
                 )
                 if top_rules:
                     # 把规则文本拼到 skill_doc 末尾, setter 会读
@@ -615,6 +657,25 @@ class Orchestrator:
                     )
             except Exception as e:
                 _log.warning(f"  videoweaver prior failed: {e}")
+
+        # ★ L4 meta-skill 注入 (cross-family transferable patterns). 之前 promote 后
+        # 只存不读 → applied_count 永远 0 (write-only). 现在: retrieve 本 family 适用的
+        # meta-skill, 注入 setter, 并记下名字 → rollout 结束按真实 sandbox 结果回写
+        # record_meta_skill_application, 闭合 ReasoningBank/ACE 的 helpful/harmful 计数环.
+        if self.cfg.baseline_mode == "v2" and getattr(self, "mem", None) is not None:
+            try:
+                metas = self.mem.get_meta_skills(family=family_name)
+                if metas:
+                    meta_block = "\n\n## 🧠 Cross-family META-SKILLS (proven transferable):\n"
+                    for m in metas[:3]:
+                        meta_block += (f"- [{m.name}] (spans {', '.join(m.spans_families)}; "
+                                       f"success {m.success_rate:.0%}/{m.applied_count} uses)\n"
+                                       f"  {m.body[:200]}\n")
+                        injected_meta_names.append(m.name)
+                    skill_doc = skill_doc + meta_block
+                    _log.info(f"  [L4] injected {len(injected_meta_names)} meta-skill(s)")
+            except Exception as e:
+                _log.warning(f"  meta-skill injection failed: {e}")
 
         # ★ F2 FIX (核心 self-evolution): 强制 setter 从 seed_library top-k chain 起步,
         # mutate ≤2 ops. 之前 setter 只是"参考" skill_doc → LLM creative override
@@ -710,7 +771,7 @@ class Orchestrator:
                 try:
                     from simple_seed_library import SimpleSeedLibrary
                     self.seed_library_v2 = SimpleSeedLibrary(
-                        db_path=str(self.out_dir / "seed_library_v2" / "seeds.db"),
+                        db_path=str(self.bank_dir / "seed_library_v2" / "seeds.db"),
                     )
                 except Exception:
                     self.seed_library_v2 = None
@@ -816,9 +877,12 @@ class Orchestrator:
                 )
                 self.total_cost += 0.002  # attribution cost
                 attribution = attr_list
-                composite = self.attributor.composite_reward(
-                    attr_list, r_out=1.0 if verdicts.sandbox_pass else 0.0,
-                )
+                # ★ 连续 r_out: 真突破=1.0; 否则=w·soft_evade(给搜索朝反检测爬的梯度)
+                if verdicts.sandbox_pass:
+                    r_out = 1.0
+                else:
+                    r_out = self.cfg.evade_shaping_weight * _soft_evade_score(verdicts.tier1)
+                composite = self.attributor.composite_reward(attr_list, r_out=r_out)
             except Exception as e:
                 _log.warning(f"  attribution failed: {e}")
 
@@ -864,10 +928,10 @@ class Orchestrator:
             except Exception as e:
                 _log.warning(f"family_agents update failed: {e}")
 
-        # ★ Tier 2-2 fix: VideoWeaver Composition+Creator 2-layer skill record
-        # Earlier `if s.params` was too aggressive — most ops have empty params.
-        # Composition only cares about chain SHAPE, so record all ops; Creator
-        # internally skips ops with empty params (see videoweaver_skills.record_rollout).
+        # ★ Tier 2-2 fix: VideoWeaver Composition+Creator 2-layer skill record.
+        # Composition records the chain SHAPE; Creator now records EVERY op
+        # (incl. default/empty params) so per-op success stats accumulate.
+        # success is gated on the real sandbox verdict (verdicts.sandbox_pass).
         if hasattr(self, "videoweaver_skills") and self.videoweaver_skills is not None:
             try:
                 vw_chain = [{"tool": s.tool, "params": s.params or {}}
@@ -880,6 +944,46 @@ class Orchestrator:
                     )
             except Exception as e:
                 _log.warning(f"videoweaver skills update failed: {e}")
+
+        # ★ Fix ③: wire REAL sandbox outcome back into seed library.
+        # Before this, record_attempt was never called → sandbox_success_count
+        # stayed 0 for every seed → seeds were "0 sandbox-verified" (proxy-only).
+        # Now: on real bypass, promote the winning chain + record a true success;
+        # on reused-seed failure, record the failure so prune() can retire it.
+        active_seed_lib = (getattr(self, "seed_library_v2", None)
+                           if self.cfg.baseline_mode == "v2"
+                           else getattr(self, "seed_library_v1", None))
+        if active_seed_lib is not None and exec_steps:
+            try:
+                from simple_seed_library import _chain_key
+                exec_chain = [{"tool": s.tool, "params": getattr(s, "params", {}) or {}}
+                              for s in exec_steps]
+                chain_id = _chain_key(family_name, exec_chain)
+                if verdicts.sandbox_pass:
+                    # ensure a sandbox-verified winner is in the pool, then count it
+                    active_seed_lib.promote_chain(
+                        family_name, exec_chain,
+                        four_dim={"weighted": 0.75, "attack_success": 1.0,
+                                   "coverage": 0.6, "generalization": 0.6,
+                                   "defense_evasion": 1.0},
+                        source="sandbox_verified",
+                    )
+                    active_seed_lib.record_attempt(chain_id, success=True)
+                else:
+                    # only updates if this chain is a tracked seed (no-op otherwise)
+                    active_seed_lib.record_attempt(chain_id, success=False)
+            except Exception as e:
+                _log.warning(f"seed_library sandbox write-back failed: {e}")
+
+        # ★ L4 meta-skill applied loop: close the helpful/harmful counter using the
+        # REAL sandbox verdict for every meta-skill injected into this rollout's brief.
+        if injected_meta_names and getattr(self, "mem", None) is not None:
+            for _mname in injected_meta_names:
+                try:
+                    self.mem.record_meta_skill_application(
+                        _mname, success=bool(verdicts.sandbox_pass))
+                except Exception as e:
+                    _log.warning(f"meta-skill application record failed ({_mname}): {e}")
 
         # ★ Tier 2-3 (Method 3 挂载+一起更新): record per-rollout into co-evolution state
         if hasattr(self, "coevo") and self.coevo is not None:
@@ -1016,6 +1120,10 @@ class Orchestrator:
                                 hasattr(traj, "_novelty_meta") and traj._novelty_meta):
                             novelty_r = float(traj._novelty_meta.get("novelty_score", 0.0))
                         r = 0.7 * bypass_r + 0.3 * novelty_r if novelty_r > 0 else bypass_r
+                        # ★ 无突破时叠加连续 bypass-proximity 梯度(让家族选择器朝反检测爬,
+                        #    而非仅靠 novelty 探索;有突破时 bypass 仍强主导,不加 evade)
+                        if bypass_r == 0.0 and traj.verdicts:
+                            r += self.cfg.evade_shaping_weight * _soft_evade_score(traj.verdicts.tier1)
                         prev_family = current_family
                         self.family_selector.update(prev_family, current_family, r)
                     # L8: end-of-rollout summary
@@ -1055,10 +1163,25 @@ class Orchestrator:
                 txt = getattr(doc, "content", "")
                 if txt:
                     family_docs[fam] = txt
+            # Fix ③: only mine families with a REAL sandbox-verified bypass,
+            # so L4 meta-skills reflect what actually worked (not proxy/log noise).
+            verified_families = None
+            seed_lib = (getattr(self, "seed_library_v2", None)
+                        if self.cfg.baseline_mode == "v2"
+                        else getattr(self, "seed_library_v1", None))
+            if seed_lib is not None:
+                try:
+                    verified_families = {
+                        r["family"] for r in seed_lib.get_all_active()
+                        if int(r.get("sandbox_success_count", 0)) > 0
+                    }
+                except Exception as e:
+                    _log.warning(f"  [L4] verified-family lookup failed: {e}")
             if len(family_docs) >= 2:
                 ms = self.mem.promote_to_meta_skill(family_docs,
                                                     threshold_families=2,
-                                                    round_id=round_id)
+                                                    round_id=round_id,
+                                                    verified_families=verified_families)
                 if ms:
                     _log.info(f"  [L4] promoted meta-skill {ms.name} spans {ms.spans_families}")
 
@@ -1104,7 +1227,14 @@ class Orchestrator:
                     current_skill_doc=self.skill_lib.docs[family].content,
                 )
                 self.skill_lib.update_skill(family, delta)
-                _log.info(f"  𝒮_k[{family}] updated, word_count={self.skill_lib.docs[family].word_count()}")
+                doc = self.skill_lib.docs[family]
+                _log.info(f"  𝒮_k[{family}] updated, word_count={doc.word_count()}")
+                # persist version snapshot to data_flow.skill_versions (was never
+                # wired → table stayed empty even when the doc evolved).
+                try:
+                    self.data_flow.snapshot_skill(family, doc.version, doc.content)
+                except Exception as e:
+                    _log.warning(f"  snapshot_skill failed: {e}")
             except Exception as e:
                 _log.warning(f"  skill update v2 failed: {e}")
 
@@ -1116,20 +1246,27 @@ class Orchestrator:
         if len(self.recent_outcomes) % max(self.cfg.supervisor_every, 1) != 0:
             return
         last = self.recent_outcomes[-1]
+        fam = last["family"]
         constraint = f"R{round_id} outcome: bypass={last['bypass']}, summary={last['summary'][:200]}"
-        self.skill_book_v1.append_constraint(last["family"], constraint)
+        self.skill_book_v1.append_constraint(fam, constraint)
+        try:
+            self.data_flow.snapshot_skill(
+                fam, self.skill_book_v1.append_count.get(fam, 0),
+                self.skill_book_v1.get_doc(fam))
+        except Exception as e:
+            _log.warning(f"  snapshot_skill (v1) failed: {e}")
 
     def _end_of_round(self, round_id: int):
         # Snapshot Markov state (v2)
         if self.cfg.baseline_mode == "v2":
             self.data_flow.snapshot_markov(round_id,
                 self.family_selector.transition_summary(), run_id=self.run_id)
-            self.family_selector.save(str(self.out_dir / "markov" / "markov_state.json"))
+            self.family_selector.save(str(self.bank_dir / "markov" / "markov_state.json"))
         # ★ TIER1-M1-3: v1 也持久化 Markov state (内部文章图2)
         elif self.cfg.baseline_mode == "v1" and self.cfg.v1_use_markov \
                 and isinstance(self.family_selector, MarkovFamilySelector):
-            (self.out_dir / "markov").mkdir(parents=True, exist_ok=True)
-            self.family_selector.save(str(self.out_dir / "markov" / "markov_state_v1.json"))
+            (self.bank_dir / "markov").mkdir(parents=True, exist_ok=True)
+            self.family_selector.save(str(self.bank_dir / "markov" / "markov_state_v1.json"))
         # ★ M2-P0-1: 持久化 family_agents 经验日志 (v1 + v2 都用)
         if hasattr(self, "family_agents"):
             try:
@@ -1150,7 +1287,7 @@ class Orchestrator:
                     markov=self.family_selector if hasattr(self, "family_selector") else None,
                 )
                 _log.info(f"  [co-evo] defender→attacker broadcast: channels={upd.get('channels', [])}")
-                snap_path = self.coevo.snapshot(str(self.out_dir / "coevo_snapshots"))
+                snap_path = self.coevo.snapshot(str(self.bank_dir / "coevo_snapshots"))
                 if snap_path: _log.info(f"  [co-evo] state snapshot → {Path(snap_path).name}")
             except Exception as e:
                 _log.warning(f"co-evo broadcast failed: {e}")
@@ -1161,7 +1298,7 @@ class Orchestrator:
             if not hasattr(self, "seed_library_v2"):
                 from simple_seed_library import SimpleSeedLibrary
                 self.seed_library_v2 = SimpleSeedLibrary(
-                    db_path=str(self.out_dir / "seed_library_v2" / "seeds.db"),
+                    db_path=str(self.bank_dir / "seed_library_v2" / "seeds.db"),
                 )
             try:
                 from simple_4_evolutions import FourEvolutionsOrchestrator
@@ -1333,6 +1470,9 @@ def main():
                         default="viviai", help="★ Lv5: 切 sandbox Tier-2 detector backend")
     parser.add_argument("--fakevlm-endpoint", default="http://localhost:8000/v1")
     parser.add_argument("--out", default="outputs")
+    parser.add_argument("--bank-dir", default="",
+                        help="long-horizon (长程) shared bank dir for cross-scenario "
+                             "skill/markov/reasoning accumulation; empty=use --out")
     parser.add_argument("--src-pool", nargs="+", default=None,
                         help="src face image paths (>=1)")
     parser.add_argument("--multi-agent-preset", choices=["w1_cheap", "w6_full"],
@@ -1340,6 +1480,9 @@ def main():
                         help="L2 fan-out: w1_cheap (all flash) or w6_full (gemini-3-pro mix)")
     parser.add_argument("--no-checkers", action="store_true",
                         help="跳过 3-checker median 评分 (省钱)")
+    parser.add_argument("--evade-weight", type=float, default=0.3,
+                        help="连续 bypass-proximity 奖励权重 (bypass=0 时给搜索朝反检测爬的梯度; "
+                             "0=关闭, 回退旧二值行为)")
     args = parser.parse_args()
 
     src_pool = args.src_pool or [
@@ -1359,9 +1502,11 @@ def main():
         tier2_backend=args.tier2_backend,
         fakevlm_endpoint=args.fakevlm_endpoint,
         output_dir=args.out,
+        bank_dir=args.bank_dir,
         src_face_paths=src_pool,
         multi_agent_preset=args.multi_agent_preset,
         enable_checkers=not args.no_checkers,
+        evade_shaping_weight=args.evade_weight,
     )
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")

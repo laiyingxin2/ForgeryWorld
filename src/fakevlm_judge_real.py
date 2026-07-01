@@ -32,9 +32,13 @@ _log = logging.getLogger(__name__)
 
 @dataclass
 class FakeVLMJudgeConfig:
-    ckpt_path: str = "/cpfs01/bob_workspace/students/lyx/ICML/FakeVLM/Origin/FakeVLM/checkpoints/multi_20260329_132526_llava-1.5-7b"
-    # vLLM server 启动后的 endpoint
-    vllm_endpoint: str = "http://localhost:8000/v1"
+    # The VALIDATED faithful checkpoint (95% bal-acc on gold). The old default
+    # `multi_20260329…` ckpt was a broken multi-task retrain that emitted captions /
+    # bare "Real" for every image — it produced 100% of the spurious historical
+    # bypasses. Do NOT point this back at the multi_ ckpt.
+    ckpt_path: str = "/data/disk4/lyx_ICML/self_evolution_forgery/scripts/fakevlm_correct_ckpt"
+    # vLLM server endpoint — the stacked GPU7 server that serves fakevlm_correct_ckpt
+    vllm_endpoint: str = "http://localhost:8001/v1"
     vllm_api_key: str = "EMPTY"
     # 推理参数
     temperature: float = 0.1
@@ -89,7 +93,7 @@ class FakeVLMJudge:
 
     @staticmethod
     def _parse_verdict(raw: str) -> tuple:
-        """Map FakeVLM free-text to (is_fake, confidence).
+        """Map FakeVLM free-text to (is_fake, confidence, decided).
 
         Replicates the EXACT protocol from FakeVLM's official eval_vllm.py (the one
         that scored 98.9% on fakeclue_test): scan the FIRST sentence — if it contains
@@ -98,27 +102,33 @@ class FakeVLMJudge:
         back to the second sentence. An explicit <answer> tag, if present, wins.
 
         is_fake = (pred == 0) where eval labels 1=real, 0=fake.
+
+        `decided` is False when the model returned NO real/fake verdict word anywhere
+        (a generic caption, empty/newline garbage, or a VQA hallucination). The caller
+        MUST NOT treat an undecided output as "real" — doing so manufactured 31% of the
+        spurious historical bypasses (broken-ckpt captions defaulting to real@0.5). An
+        undecided judgement means the detector FAILED to rule, not that it was fooled.
         """
         import re
         s = (raw or "").strip()
         low = s.lower()
         m = re.findall(r'<answer>\s*(real|fake)\s*</answer>', low)
         if m:
-            return (m[-1] == "fake"), 0.9
+            return (m[-1] == "fake"), 0.9, True
         parts = low.split('.')
         first = parts[0] if parts else low
         if 'real' in first:
-            return False, 0.85
+            return False, 0.85, True
         if 'fake' in first:
-            return True, 0.85
+            return True, 0.85, True
         # fallback: second sentence (matches eval_vllm.py)
         second = parts[1] if len(parts) > 1 else ""
         if 'real' in second:
-            return False, 0.7
+            return False, 0.7, True
         if 'fake' in second:
-            return True, 0.7
-        # nothing decisive anywhere → treat as real (benefit of doubt), low conf
-        return False, 0.5
+            return True, 0.7, True
+        # nothing decisive anywhere → UNDECIDED. Not a verdict, not a bypass.
+        return False, 0.0, False
 
     def judge(self, image_path: Union[str, Path]) -> dict:
         """Return same shape as sandbox.tier2_llm_judge.
@@ -162,16 +172,20 @@ class FakeVLMJudge:
             )
             r.raise_for_status()
             raw = r.json()["choices"][0]["message"]["content"]
-            is_fake, conf = self._parse_verdict(raw)
+            is_fake, conf, decided = self._parse_verdict(raw)
             return {
                 "model": (self.cfg.lora_model_name or
                           f"fakevlm/{Path(self.cfg.ckpt_path).name}"),
                 "is_fake": is_fake,
                 "confidence": conf,
                 "attack_family_guess": "unknown",
-                "reasoning": raw[:500],
+                "reasoning": raw[:500] if decided else f"[UNDECIDED — no real/fake verdict] {raw[:200]}",
                 "raw_text": raw,
-                "success": True,
+                # An undecided output (caption / garbage / hallucination) is NOT a
+                # successful judgement. success=False keeps sandbox.verify from counting
+                # it as tier2_says_real → no spurious bypass (matches the Q17 "never
+                # silent bypass on tier2 failure" invariant).
+                "success": bool(decided),
             }
         except Exception as e:
             return {

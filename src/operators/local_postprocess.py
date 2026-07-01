@@ -231,6 +231,84 @@ class GFPGANRestoreOperator(ApiImageOperator):
                 duration_sec=time.time() - t0, model_used=self.model_id)
 
 
+class LightingOperator(ApiImageOperator):
+    """Photometric relight: imposes a lighting condition on an already-forged
+    image so swap/reenact families (which have no text-prompt path) can still
+    realize the grid's `lighting` axis.
+
+    mode:
+      dark        gamma-darken + global brightness drop  (mean ~179 → ~95)
+      strong      brighten + mild highlight clip          (overexposed look)
+      back_light  bright rim + darkened face center       (silhouette / haloed)
+      normal      identity pass-through (axis already satisfied)
+    """
+    model_id = "relight"
+    family = "postprocess"
+    cost_per_call = 0.0
+
+    def __init__(self, client=None, out_dir: str = "/tmp/face_attack_outputs"):
+        self.client = client
+        self.out_dir = Path(out_dir); self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def name(self) -> str: return self.__class__.__name__
+
+    @staticmethod
+    def _gamma(bgr: np.ndarray, g: float) -> np.ndarray:
+        inv = 1.0 / max(1e-3, g)
+        lut = np.clip(((np.arange(256) / 255.0) ** inv) * 255.0, 0, 255).astype(np.uint8)
+        import cv2
+        return cv2.LUT(bgr, lut)
+
+    @staticmethod
+    def _radial_mask(h: int, w: int, invert: bool = False) -> np.ndarray:
+        """Center-bright radial falloff in [0,1]; invert → center-dark."""
+        yy, xx = np.mgrid[0:h, 0:w]
+        cy, cx = h / 2.0, w / 2.0
+        d = np.sqrt(((yy - cy) / cy) ** 2 + ((xx - cx) / cx) ** 2)
+        m = np.clip(1.0 - d / 1.4142, 0.0, 1.0)
+        return (1.0 - m) if invert else m
+
+    def run(self, src_face_path: Optional[str] = None,
+             params: Optional[dict] = None, size: Optional[str] = None,
+             tgt_face_path: Optional[str] = None):
+        t0 = time.time()
+        params = params or {}
+        mode = str(params.get("mode", "dark")).lower()
+        if not src_face_path or not Path(src_face_path).exists():
+            return OperatorResult(success=False, error="no src",
+                duration_sec=time.time() - t0, model_used=self.model_id)
+        try:
+            import cv2
+            bgr = cv2.imread(src_face_path)
+            if bgr is None:
+                return OperatorResult(success=False, error="cv2 read fail",
+                    duration_sec=time.time() - t0, model_used=self.model_id)
+            f = bgr.astype(np.float32)
+            h, w = bgr.shape[:2]
+            if mode in ("dark", "low_light", "night"):
+                out = self._gamma(bgr, 0.45)              # crush mid/shadows
+                out = np.clip(out.astype(np.float32) * 0.72, 0, 255).astype(np.uint8)
+            elif mode in ("strong", "bright", "harsh"):
+                out = self._gamma(bgr, 1.7)               # lift toward highlights
+                out = np.clip(out.astype(np.float32) * 1.18, 0, 255).astype(np.uint8)
+            elif mode in ("back_light", "backlight", "rim"):
+                rim = self._radial_mask(h, w, invert=True)[:, :, None]   # bright edges
+                bright = np.clip(f * (1.0 + 0.9 * rim), 0, 255)
+                center_dark = self._radial_mask(h, w)[:, :, None]        # dark center
+                out = np.clip(bright * (1.0 - 0.45 * center_dark), 0, 255).astype(np.uint8)
+            else:  # normal / unknown → identity
+                out = bgr
+            out_path = self.out_dir / f"relight_{mode}_{uuid.uuid4().hex[:8]}.png"
+            cv2.imwrite(str(out_path), out)
+            return OperatorResult(success=True, output_path=str(out_path),
+                cost_usd=0.0, duration_sec=time.time() - t0,
+                model_used=self.model_id, raw_response=f"relight {mode}")
+        except Exception as e:
+            return OperatorResult(success=False, error=str(e)[:200],
+                duration_sec=time.time() - t0, model_used=self.model_id)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     src = "/data/disk4/lyx_ICML/self_evolution_forgery/data/real_faces/0_row0_real.png"

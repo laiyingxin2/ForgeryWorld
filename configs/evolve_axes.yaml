@@ -1,0 +1,176 @@
+# Inner-layer MAP-Elites descriptor axes for the two-layer open-ended red-team.
+#
+# Grounded 2026-06-29 in deepfake/KYC-liveness/审核 benchmark taxonomies
+# (DF40, FF++, CelebAMask-HQ, CelebA-40, SiW/CASIA-SURF/OULU-NPU/CelebA-Spoof,
+#  DeeperForensics-1.0, DFDC). See memory project_two_layer_openended_redesign.md.
+#
+# grid_axes  : the 2-3 axes that actually key the MAP-Elites archive cell.
+#              cells = product of value-counts, so keep this small (b^d fillable).
+# tag_axes   : recorded as metadata on every elite but NOT gridded. Promote a tag
+#              to a grid axis (or switch to CVT-MAP-Elites) later if coverage demands.
+
+grid_axes:
+  forgery_family:        # DF40 4-family + FF++ lineage
+    - swap               # FS  face-swap
+    - reenact            # FR  expression/pose transfer
+    - entire_synthesis   # EFS whole-face generation, no identity input
+    - attribute_edit     # FE  localized attribute edit
+    - id_diff            # diffusion identity-preserving regen
+  pai:                   # presentation-attack instrument (KYC liveness; CelebA-Spoof/SiW)
+    - live
+    - print_photo
+    - replay_video
+    - mask_2d
+    - mask_3d
+    - paper_cut
+    - deepfake_injection
+  lighting:              # CelebA-Spoof illumination; `dark` is a confirmed bypass mode
+    - normal
+    - strong
+    - back_light
+    - dark
+
+tag_axes:
+  generator_family:      # which engine produced the forgery
+    - graphics_warp
+    - autoencoder
+    - gan
+    - diffusion
+    - id_adapter
+  blend_region:          # CelebAMask-HQ 19-class facial components (fine grained)
+    - left_eye
+    - right_eye
+    - left_brow
+    - right_brow
+    - nose
+    - upper_lip
+    - lower_lip
+    - inner_mouth
+    - cheek_skin
+    - jaw_chin
+    - hairline
+    - left_ear
+    - right_ear
+    - neck
+    - eyeglasses
+    - hat
+    - full_face
+  semantic_attribute:    # CelebA-40 attacker-relevant subset
+    - none
+    - younger
+    - older
+    - gender_shift
+    - add_eyeglasses
+    - add_beard
+    - heavy_makeup
+    - add_bangs
+    - bald
+    - pale_skin
+  identity_source:
+    - in_dist_celeb
+    - kyc_id_photo
+    - cross_demographic
+    - cross_species_ood
+    - synthetic_novel_id
+  environment_sensor:    # CelebA-Spoof env + OULU-NPU sensors
+    - indoor
+    - outdoor
+    - phone_cam
+    - webcam
+    - tablet_cam
+  pose_yaw:
+    - frontal
+    - yaw_left
+    - yaw_right
+    - pitch_up
+    - pitch_down
+  occlusion:
+    - none
+    - sunglasses
+    - hat_cap
+    - mask_scarf
+    - hand
+    - hair_over_face
+    - partial_crop
+  post_process:          # DFDC degradation chain
+    - none
+    - jpeg_low
+    - downscale
+    - recompress
+    - webp
+  perturbation:          # DeeperForensics-1.0 distortions + adversarial
+    - none
+    - gaussian_noise
+    - gaussian_blur
+    - contrast_shift
+    - color_temp_shift
+    - adv_patch_pgd
+
+# ─────────────────────────── mappings (logic, tunable) ───────────────────────────
+# How a sampled descriptor instantiates a concrete generation. Kept here so the
+# attack vocabulary stays editable without touching code.
+
+# forgery_family -> candidate base operators (OPERATOR_REGISTRY keys, pre-resolve_op)
+family_ops:
+  swap:             [inswapper_128_local, simswap_256_local]
+  reenact:          [liveportrait]
+  entire_synthesis: [sdxl_t2i]
+  attribute_edit:   [instructpix2pix]
+  id_diff:          [instantid, ipadapter_face]
+
+# tag values that, when sampled, append a post-process operator stage (chained
+# after the base forgery op). Maps the post_process / perturbation / pai axes onto
+# real registry ops so those axes have teeth, not just labels.
+post_ops:
+  jpeg_low:        jpeg_70
+  downscale:       resize_50pct
+  recompress:      recompress_chain
+  webp:            webp_compress
+  gaussian_noise:  gaussian_blur      # closest registered op
+  gaussian_blur:   gaussian_blur
+  contrast_shift:  brightness_shift
+  color_temp_shift: brightness_shift
+  adv_patch_pgd:   adv_patch_pgd
+  replay_video:    screen_replay_sim  # PAI replay -> screen-replay simulation
+  print_photo:     recompress_chain   # PAI print -> recompress artifact
+  mask_2d:         moire_inject
+
+# natural-language prompt fragments injected into diffusion/synthesis ops so the
+# lighting / attribute / environment / pose / occlusion descriptors steer generation.
+prompt_fragments:
+  lighting:
+    normal:     "even natural lighting"
+    strong:     "harsh bright direct lighting, slightly overexposed"
+    back_light: "strong backlight, face in shadow, silhouette rim light"
+    dark:       "photographed in a very dark dimly-lit room, low light, underexposed, heavy shadows"
+  semantic_attribute:
+    younger:        "appearing noticeably younger"
+    older:          "appearing noticeably older, aged"
+    gender_shift:   "with shifted gender presentation"
+    add_eyeglasses: "wearing eyeglasses"
+    add_beard:      "with a full beard"
+    heavy_makeup:   "wearing heavy makeup"
+    add_bangs:      "with bangs covering the forehead"
+    bald:           "bald, no hair"
+    pale_skin:      "with very pale skin"
+  environment_sensor:
+    indoor:     "indoor setting"
+    outdoor:    "outdoor setting"
+    phone_cam:  "shot on a phone front camera, slight wide-angle distortion"
+    webcam:     "low-quality webcam capture"
+    tablet_cam: "tablet camera capture"
+  pose_yaw:
+    frontal:    "facing the camera frontally"
+    yaw_left:   "head turned to the left, three-quarter view"
+    yaw_right:  "head turned to the right, three-quarter view"
+    pitch_up:   "face tilted upward"
+    pitch_down: "face tilted downward"
+  occlusion:
+    sunglasses:     "wearing sunglasses"
+    hat_cap:        "wearing a cap"
+    mask_scarf:     "lower face covered by a scarf"
+    hand:           "part of the face occluded by a hand"
+    hair_over_face: "hair partially covering the face"
+    partial_crop:   "face partially out of frame"
+  identity_source:
+    cross_species_ood: "with subtle non-human animal facial features blended in"

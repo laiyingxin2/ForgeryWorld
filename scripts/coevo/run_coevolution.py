@@ -117,14 +117,21 @@ def main():
         before = list_outputs(fao)
 
         # 1. attacker round (shared out dir -> skills accumulate = attacker self-evolves)
-        cmd = [args.py, "orchestrator.py", "--mode", "v2", "--rounds", "1",
+        cmd = [args.py, "legacy/orchestrator.py", "--mode", "v2", "--rounds", "1",
                "--briefs", str(args.briefs), "--rollouts", str(args.rollouts),
                "--multi-agent-preset", "w6_full",
                "--tier2-backend", "fakevlm_local", "--fakevlm-endpoint", args.endpoint,
                "--src-pool", *args.src_pool, "--out", str(m3)]
         runlog = open(coevo / f"attacker_r{R}.log", "w")
         log(f"  attacker: orchestrator --rounds 1 (briefs={args.briefs} rollouts={args.rollouts})")
-        rc = subprocess.run(cmd, cwd=str(proj / "src"), stdout=runlog, stderr=subprocess.STDOUT)
+        # orchestrator.py imports siblings from BOTH src/ (viviai_client) and
+        # src/legacy/ (trajectory_schema); give it an absolute PYTHONPATH for both.
+        att_env = dict(os.environ)
+        _pp = os.pathsep.join([str(proj / "src"), str(proj / "src" / "legacy")])
+        att_env["PYTHONPATH"] = (_pp + os.pathsep + att_env["PYTHONPATH"]
+                                 if att_env.get("PYTHONPATH") else _pp)
+        rc = subprocess.run(cmd, cwd=str(proj / "src"), stdout=runlog,
+                            stderr=subprocess.STDOUT, env=att_env)
         runlog.close()
         if rc.returncode != 0:
             log(f"  !! attacker round failed (rc={rc.returncode}); see attacker_r{R}.log"); sys.exit(1)

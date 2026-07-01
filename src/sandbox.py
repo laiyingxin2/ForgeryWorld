@@ -509,24 +509,63 @@ IDENTITY_FAMILIES = {
 MIN_ARCFACE_IDENTITY = 0.30  # below this the "face" carries no usable identity
 
 
-def _face_valid(tier1: dict, attack_family: Optional[str]) -> bool:
-    """A forgery is a valid face-KYC bypass only if it actually contains a face.
+def _face_type(tier1: dict, attack_family: Optional[str]) -> str:
+    """Label a forgery by what kind of face it carries — never rejects it.
 
-    arcface_id_sim == -1.0 and landmark_consistency <= 0 are insightface sentinels
-    for 'no face detected'. For identity families we additionally require the
-    forged face to carry a plausible target identity (arcface >= MIN_ARCFACE).
+    Two-layer open-ended redesign (2026-06-29): realism is no longer a hard gate.
+    OOD / cross-species / faceless samples that fool the frozen detector are
+    legitimate failure modes worth keeping (cf. Hendrycks Natural Adversarial
+    Examples). So instead of a boolean accept/reject we emit a descriptor label
+    that the MAP-Elites archive records; the inner loop gates only on detector
+    fitness, not on face validity.
+
+    Returns one of:
+      "non_face"    : no detectable face geometry (insightface sentinels)
+      "low_id_face" : a face is present but carries little/no target identity
+                      (random / garbage / cross-species) — only meaningful for
+                      identity-driven families
+      "face"        : a face with a plausible identity
     """
     if not tier1:
-        return False
+        return "non_face"
     arc = tier1.get("arcface_id_sim", -1.0)
     lm = tier1.get("landmark_consistency", -1.0)
-    if lm is None or lm <= 0.0:          # no detectable face geometry
-        return False
-    if arc == -1.0:                       # insightface found no face
-        return False
-    if attack_family in IDENTITY_FAMILIES and arc < MIN_ARCFACE_IDENTITY:
-        return False                      # face present but identity is random/garbage
-    return True
+    # Face presence is decided by landmark geometry only. arc == -1.0 means the
+    # ArcFace identity cosine could not be COMPUTED (no source reference passed,
+    # e.g. pure text-to-image synthesis), which is NOT the same as "no face" — a
+    # valid landmark proves a face is present. Gating non_face on arc here wrongly
+    # labelled every src-less synthesis as faceless.
+    if lm is None or lm <= 0.0:   # insightface found no face geometry
+        return "non_face"
+    if attack_family in IDENTITY_FAMILIES and (arc == -1.0 or arc < MIN_ARCFACE_IDENTITY):
+        return "low_id_face"
+    return "face"
+
+
+def _augment_view(img_bgr: "np.ndarray", rng) -> "np.ndarray":
+    """One LIGHT perturbation of a BGR image for the MC-augmentation graded proxy.
+
+    Deliberately mild (small JPEG/brightness/blur/noise) — the point is to probe how
+    *robustly* the detector calls the image fake, not to evade it. A candidate sitting
+    near the detector's decision boundary flips on more of these views than one deep in
+    fake-space, so the FRACTION-still-fake is a graded [0,1] signal even when each single
+    verdict is near-binary. (Ilyas et al. 2018, label-only black-box, arXiv:1804.08598.)"""
+    import cv2
+    out = img_bgr
+    q = int(rng.integers(70, 96))
+    ok, enc = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+    if ok:
+        dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+        if dec is not None:
+            out = dec
+    b = 1.0 + float(rng.uniform(-0.08, 0.08))
+    out = np.clip(out.astype(np.float32) * b, 0, 255).astype(np.uint8)
+    if rng.random() < 0.5:
+        out = cv2.GaussianBlur(out, (3, 3), 0)
+    if rng.random() < 0.5:
+        noise = rng.normal(0.0, 2.0, out.shape)
+        out = np.clip(out.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    return out
 
 
 # ────────────────────────── Orchestrator ──────────────────────────────
@@ -542,6 +581,7 @@ class SandboxVerdict:
     cost_usd: float = 0.0
     detector_signature: str = ""
     timestamp: float = 0.0
+    face_type: str = ""          # {face, low_id_face, non_face} — label, not a gate
 
 
 class SandboxVerifier:
@@ -572,7 +612,9 @@ class SandboxVerifier:
         confidence_threshold: float = 0.5,
         tier2_backend: str = "viviai",          # ★ Lv5 switch
         fakevlm_ckpt_path: Optional[str] = None,
-        fakevlm_endpoint: str = "http://localhost:8000/v1",
+        fakevlm_endpoint: str = "http://localhost:8001/v1",
+        graded_mc_n: int = 0,                    # MC-augmentation graded proxy views
+        graded_mc_seed: int = 0,
         logger: Optional[logging.Logger] = None,
     ):
         self.client = client or ViviClient()
@@ -582,6 +624,8 @@ class SandboxVerifier:
         self.tier3_top_quantile = tier3_top_quantile
         self.confidence_threshold = confidence_threshold
         self.tier2_backend = tier2_backend
+        self.graded_mc_n = int(graded_mc_n)
+        self.graded_mc_seed = int(graded_mc_seed)
         self.logger = logger or logging.getLogger(__name__)
 
         # ★ Lv5: 懒加载 FakeVLM judge (只在用时 import)
@@ -590,8 +634,9 @@ class SandboxVerifier:
             try:
                 from fakevlm_judge_real import FakeVLMJudge, FakeVLMJudgeConfig
                 cfg = FakeVLMJudgeConfig(
+                    # default to the VALIDATED faithful ckpt, never the broken multi_ retrain
                     ckpt_path=fakevlm_ckpt_path or
-                        "/cpfs01/bob_workspace/students/lyx/ICML/FakeVLM/Origin/FakeVLM/checkpoints/multi_20260329_132526_llava-1.5-7b",
+                        "/data/disk4/lyx_ICML/self_evolution_forgery/scripts/fakevlm_correct_ckpt",
                     vllm_endpoint=fakevlm_endpoint,
                 )
                 self._fakevlm_judge = FakeVLMJudge(cfg)
@@ -614,13 +659,67 @@ class SandboxVerifier:
 
     @property
     def detector_signature(self) -> str:
-        tier2_label = ("fakevlm_local" if self.tier2_backend == "fakevlm_local"
-                       and self._fakevlm_judge is not None
-                       else self.tier2_model)
+        if (self.tier2_backend == "fakevlm_local" and self._fakevlm_judge is not None):
+            # Encode the ACTUAL ckpt + endpoint port so runs against different
+            # checkpoints are distinguishable. The old bare `fakevlm_local` label
+            # collapsed the broken multi_ ckpt and the faithful ckpt into one
+            # signature, which is what let the wrong-ckpt contamination hide.
+            from pathlib import Path as _P
+            cfg = self._fakevlm_judge.cfg
+            ckpt = _P(cfg.ckpt_path).name
+            port = cfg.vllm_endpoint.rstrip("/").rsplit(":", 1)[-1].split("/")[0]
+            tier2_label = f"fakevlm_local[{ckpt}@{port}]"
+        else:
+            tier2_label = self.tier2_model
         sig = f"tier1_func+tier2_{tier2_label}"
+        if self.graded_mc_n > 0:
+            sig += f"+gradedMC{self.graded_mc_n}"
         if self.tier3_enabled:
             sig += f"+tier3_{self.tier3_model}"
         return sig
+
+    def _judge_image(self, path: Union[str, Path]) -> dict:
+        """Run the configured Tier-2 backend on one image path. Tags the dict with
+        `_backend` so the caller can attribute cost. The single source of the tier2
+        verdict, reused by both verify() and the MC-augmentation graded proxy."""
+        if (self.tier2_backend == "fakevlm_local" and self._fakevlm_judge is not None
+                and self._fakevlm_judge.is_server_up()):
+            t2 = self._fakevlm_judge.judge(path)
+            t2["_backend"] = "fakevlm_local"
+        else:
+            t2 = tier2_llm_judge(path, self.client, model=self.tier2_model)
+            t2["_backend"] = self.tier2_model
+        return t2
+
+    def _augmented_real_prob(self, forged_path: Union[str, Path], n_aug: int) -> dict:
+        """MC-augmentation graded proxy. Judge `n_aug` light perturbations of the image;
+        return mean P(real) and the fraction judged real — a graded [0,1] search signal
+        that de-saturates a near-binary detector (see _augment_view)."""
+        import cv2, tempfile, os
+        img = cv2.imread(str(forged_path))
+        if img is None:
+            return {"graded_real_prob": 0.0, "graded_frac_real": 0.0, "graded_n_aug": 0}
+        rng = np.random.default_rng(self.graded_mc_seed ^ (hash(str(forged_path)) & 0xffffffff))
+        probs: list = []
+        n_real = 0
+        with tempfile.TemporaryDirectory() as td:
+            for i in range(n_aug):
+                aug = _augment_view(img, rng)
+                ap = os.path.join(td, f"aug{i}.png")
+                cv2.imwrite(ap, aug)
+                t2 = self._judge_image(ap)
+                if not t2.get("success", False):
+                    continue
+                conf = float(t2.get("confidence", 0.5))
+                pr = conf if not t2.get("is_fake", False) else (1.0 - conf)
+                probs.append(pr)
+                if not t2.get("is_fake", False):
+                    n_real += 1
+        if not probs:
+            return {"graded_real_prob": 0.0, "graded_frac_real": 0.0, "graded_n_aug": 0}
+        return {"graded_real_prob": float(np.mean(probs)),
+                "graded_frac_real": float(n_real / len(probs)),
+                "graded_n_aug": len(probs)}
 
     def verify(
         self,
@@ -640,12 +739,22 @@ class SandboxVerifier:
         tier1 = tier1_function_checks(forged_path, src_face_path)
 
         # ★ Tier-2 (LLM-judge, switchable backend)
-        if self.tier2_backend == "fakevlm_local" and self._fakevlm_judge is not None and self._fakevlm_judge.is_server_up():
-            tier2 = self._fakevlm_judge.judge(forged_path)
-            cost += self._COST.get("fakevlm_local", 0.0)
-        else:
-            tier2 = tier2_llm_judge(forged_path, self.client, model=self.tier2_model)
-            cost += self._COST.get(self.tier2_model, 0.005)
+        tier2 = self._judge_image(forged_path)
+        cost += (self._COST.get("fakevlm_local", 0.0)
+                 if tier2.get("_backend") == "fakevlm_local"
+                 else self._COST.get(self.tier2_model, 0.005))
+
+        # ★ MC-augmentation graded proxy (SEARCH signal): re-judge N light perturbations
+        # so a near-binary detector yields a graded [0,1] real-prob the evolutionary inner
+        # loop can climb. The single-shot verdict below still defines the binary bypass
+        # (the citable EVAL metric); this only enriches tier2 with graded_real_prob.
+        if self.graded_mc_n > 0:
+            g = self._augmented_real_prob(forged_path, self.graded_mc_n)
+            tier2.update(g)
+            cost += g.get("graded_n_aug", 0) * (
+                self._COST.get("fakevlm_local", 0.0)
+                if tier2.get("_backend") == "fakevlm_local"
+                else self._COST.get(self.tier2_model, 0.005))
 
         # Tier-3 gate
         tier3 = None
@@ -679,13 +788,14 @@ class SandboxVerifier:
         else:
             detector_fooled = "tier2" in confirmed_by
 
-        # ★ 2026-06-20 fix (Bug-4b): a bypass is only valid if the forgery actually
-        # CONTAINS A FACE. Many degenerate chains drop the identity op and emit a
-        # faceless/garbage image (arcface=-1, landmark=0) that a face detector
-        # trivially calls "real" — that is NOT a face-KYC bypass. Require a detected
-        # face; for identity families also require a plausible target identity.
-        face_valid = _face_valid(tier1, attack_family)
-        sandbox_pass = detector_fooled and face_valid
+        # ★ 2026-06-29 two-layer redesign: realism is no longer a hard gate. We
+        # label the face type for the archive but a bypass is now decided purely by
+        # whether the frozen detector was fooled — OOD / cross-species / faceless
+        # samples that fool it are legitimate failure modes worth keeping (cf.
+        # Hendrycks Natural Adversarial Examples). The old _face_valid AND-gate
+        # (Bug-4b) is replaced by this label so we stop discarding such samples.
+        face_type = _face_type(tier1, attack_family)
+        sandbox_pass = detector_fooled
 
         return SandboxVerdict(
             sandbox_pass=sandbox_pass,
@@ -696,6 +806,7 @@ class SandboxVerifier:
             cost_usd=round(cost, 5),
             detector_signature=self.detector_signature,
             timestamp=t0,
+            face_type=face_type,
         )
 
     def verify_to_dict(self, *args, **kwargs) -> dict:

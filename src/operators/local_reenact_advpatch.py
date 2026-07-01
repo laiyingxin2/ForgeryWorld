@@ -1,25 +1,22 @@
-"""Minimal real reenact + adv_patch operators (激活 reenact + adv_patch family).
+"""Real reenact + adv_patch operators (激活 reenact + adv_patch family).
 
 之前 reenact / adv_patch / morph / 3d_mask / audio_synth 5 个 family 在 chain
 里全 mock pass-through → 实际只有 swap chain 真攻击。
 
-这里加 2 个最小可工作 op (real output image, 不是 mock):
+这里 2 个真实可工作 op (real output image, 不是 mock):
 
-  • LivePortraitLiteOperator (reenact):
-    Lightweight reenact simulator via insightface landmarks +
-    OpenCV thin-plate-spline warp. 不需要 KwaiVGI 的 4 个 .pth + repo install,
-    用本地已有的 insightface 抽 landmark + cv2 做 mild deformation 模拟"换姿势"。
+  • LivePortraitOperator (reenact):
+    Real KwaiVGI LivePortrait — source 保 identity,driving 单帧给表情/头姿,
+    产出单张 IMAGE(非视频)。重活在隔离的 forgery_img env,经
+    liveportrait_worker.py 子进程跑,orchestrator 的 fakevlm env 不加载 torch/onnx。
 
   • AdvPatchPGDOperator (adv_patch):
     Real PGD via torchattacks (已 pip install). 用 torchvision ResNet50 作
     surrogate target (不需要 FAS-specific CNN,perturbation 在 L_inf 范围内
     仍能制造肉眼几乎不见但 FFT 有 signature 的攻击).
-
-两个都是 best-effort 简化实现 — paper 写作时标注 "lite version, full LivePortrait/
-real-FAS-PGD in future work"。但相比 mock pass-through 这是真攻击图。
 """
 from __future__ import annotations
-import os, time, uuid, logging, random
+import os, time, uuid, logging, random, subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -35,108 +32,83 @@ except ImportError:
 
 _log = logging.getLogger(__name__)
 
+FORGERY_IMG_PY = "/data/disk4/lyx_ICML/conda_envs/forgery_img/bin/python"
+_LP_WORKER = str(Path(__file__).parent / "liveportrait_worker.py")
+_LP_TIMEOUT = 600  # seconds (weights load + crop + animate)
+_DRIVING_POOL_DIR = "/data/disk4/lyx_ICML/self_evolution_forgery/data/real_faces"
 
-# ────────────────────────── LivePortrait-lite (reenact) ─────────────
 
-class LivePortraitLiteOperator(ApiImageOperator):
-    """Reenact-lite: insightface landmark + cv2 affine/TPS warp.
-    Mimics small head-pose change + expression shift."""
+# ────────────────────────── LivePortrait (real reenact) ─────────────
+
+class LivePortraitOperator(ApiImageOperator):
+    """Real LivePortrait reenactment: source identity + driving-frame motion → image.
+
+    Runs the KwaiVGI pipeline in the isolated `forgery_img` env via subprocess. The
+    driving frame is taken from `params['driving_path']` or sampled from a pool of
+    real faces (≠ source). Output is a single image (no video)."""
     model_id = "liveportrait"
     family = "reenact"
     cost_per_call = 0.0
 
-    _face_app = None
+    _driving_pool: Optional[list] = None
 
-    def __init__(self, client=None, out_dir: str = "/tmp/face_attack_outputs"):
+    def __init__(self, client=None, out_dir: str = "/tmp/face_attack_outputs",
+                 driving_pool: Optional[list] = None):
         self.client = client
         self.out_dir = Path(out_dir); self.out_dir.mkdir(parents=True, exist_ok=True)
+        self._driving_pool = driving_pool or sorted(
+            str(p) for p in Path(_DRIVING_POOL_DIR).glob("*.png"))
 
     @property
     def name(self) -> str: return self.__class__.__name__
 
-    @classmethod
-    def _ensure_face(cls):
-        if cls._face_app is not None: return
-        from insightface.app import FaceAnalysis
-        cls._face_app = FaceAnalysis(name='buffalo_l',
-            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        cls._face_app.prepare(ctx_id=0, det_size=(640, 640))
+    def _pick_driving(self, src_face_path: str, params: dict) -> Optional[str]:
+        drv = params.get("driving_path") or params.get("driving")
+        if drv and Path(drv).exists():
+            return drv
+        cands = [p for p in (self._driving_pool or []) if p != src_face_path]
+        if not cands:
+            return None
+        seed = params.get("seed")
+        return (random.Random(seed).choice(cands) if seed is not None
+                else random.choice(cands))
 
     def run(self, src_face_path: Optional[str] = None,
              params: Optional[dict] = None, size: Optional[str] = None,
              tgt_face_path: Optional[str] = None):
         t0 = time.time()
         params = params or {}
-        yaw_deg = float(params.get("yaw_deg", random.uniform(-15, 15)))
-        expression_strength = float(params.get("expression_strength", 0.3))
         if not src_face_path or not Path(src_face_path).exists():
             return OperatorResult(success=False, error="no src",
                 duration_sec=time.time() - t0, model_used=self.model_id)
+        if not Path(FORGERY_IMG_PY).exists():
+            return OperatorResult(success=False,
+                error=f"forgery_img env missing: {FORGERY_IMG_PY}",
+                duration_sec=time.time() - t0, model_used=self.model_id)
+        driving = self._pick_driving(src_face_path, params)
+        if not driving:
+            return OperatorResult(success=False, error="no driving frame available",
+                duration_sec=time.time() - t0, model_used=self.model_id)
+
+        out_path = self.out_dir / f"liveportrait_{uuid.uuid4().hex[:8]}.png"
+        cmd = [FORGERY_IMG_PY, _LP_WORKER, "--src", str(src_face_path),
+               "--driving", str(driving), "--out", str(out_path)]
         try:
-            import cv2
-            self._ensure_face()
-            bgr = cv2.imread(src_face_path)
-            if bgr is None:
-                return OperatorResult(success=False, error="cv2 read fail",
-                    duration_sec=time.time() - t0, model_used=self.model_id)
-            faces = self._face_app.get(bgr)
-            if not faces:
-                return OperatorResult(success=False, error="no face",
-                    duration_sec=time.time() - t0, model_used=self.model_id)
-            f = faces[0]
-            h, w = bgr.shape[:2]
-            x1, y1, x2, y2 = f.bbox.astype(int).tolist()
-            fw, fh = x2 - x1, y2 - y1
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-
-            # ── reenact: small affine inside face bbox to simulate head yaw ──
-            # apply a perspective warp that shears the face
-            yaw_rad = np.deg2rad(yaw_deg)
-            shear = np.sin(yaw_rad) * fw * 0.15
-            src_pts = np.float32([[x1, y1], [x2, y1], [x1, y2], [x2, y2]])
-            dst_pts = np.float32([
-                [x1 + shear, y1],         # top-left shifts based on yaw
-                [x2 + shear, y1],
-                [x1 - shear, y2],         # bottom-left shifts opposite
-                [x2 - shear, y2],
-            ])
-            M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-            warped = cv2.warpPerspective(bgr, M, (w, h),
-                                          borderMode=cv2.BORDER_REFLECT)
-
-            # ── expression: gentle gaussian on mouth region ──
-            if expression_strength > 0:
-                mouth_y1 = int(cy + fh * 0.15)
-                mouth_y2 = int(cy + fh * 0.40)
-                mouth_x1 = int(cx - fw * 0.18)
-                mouth_x2 = int(cx + fw * 0.18)
-                mouth_y1 = max(0, mouth_y1); mouth_y2 = min(h, mouth_y2)
-                mouth_x1 = max(0, mouth_x1); mouth_x2 = min(w, mouth_x2)
-                mouth_region = warped[mouth_y1:mouth_y2, mouth_x1:mouth_x2]
-                blurred = cv2.GaussianBlur(mouth_region, (0, 0), sigmaX=2)
-                blended = cv2.addWeighted(mouth_region, 1 - expression_strength,
-                                            blurred, expression_strength, 0)
-                warped[mouth_y1:mouth_y2, mouth_x1:mouth_x2] = blended
-
-            # blend back: keep non-face region untouched
-            mask = np.zeros((h, w), dtype=np.uint8)
-            # elliptical face mask
-            cv2.ellipse(mask, (cx, cy), (fw // 2, fh // 2), 0, 0, 360, 255, -1)
-            mask_3 = cv2.merge([mask, mask, mask]).astype(np.float32) / 255.0
-            # soft blend
-            mask_3 = cv2.GaussianBlur(mask_3, (0, 0), sigmaX=fw * 0.05)
-            out = (warped.astype(np.float32) * mask_3 +
-                   bgr.astype(np.float32) * (1 - mask_3)).astype(np.uint8)
-
-            out_path = self.out_dir / f"liveportrait_y{yaw_deg:+.0f}_{uuid.uuid4().hex[:8]}.png"
-            cv2.imwrite(str(out_path), out)
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=_LP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return OperatorResult(success=False, error=f"timeout >{_LP_TIMEOUT}s",
+                duration_sec=time.time() - t0, model_used=self.model_id)
+        if proc.returncode == 0 and out_path.exists():
             return OperatorResult(success=True, output_path=str(out_path),
                 cost_usd=0.0, duration_sec=time.time() - t0,
                 model_used=self.model_id,
-                raw_response=f"reenact-lite yaw={yaw_deg:.1f}° expr={expression_strength}")
-        except Exception as e:
-            return OperatorResult(success=False, error=str(e)[:200],
-                duration_sec=time.time() - t0, model_used=self.model_id)
+                raw_response=f"reenact src={Path(src_face_path).name} "
+                             f"driving={Path(driving).name}")
+        err = (proc.stderr or proc.stdout or "unknown").strip()
+        tail = err.splitlines()[-1] if err else "no stderr"
+        return OperatorResult(success=False, error=tail[:300],
+            duration_sec=time.time() - t0, model_used=self.model_id)
 
 
 # ────────────────────────── adv_patch_pgd ─────────────────────────
@@ -225,9 +197,10 @@ class AdvPatchPGDOperator(ApiImageOperator):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     src = "/data/disk4/lyx_ICML/self_evolution_forgery/data/real_faces/0_row0_real.png"
-    print("=== LivePortrait-lite smoke ===")
-    op = LivePortraitLiteOperator()
-    r = op.run(src_face_path=src)
+    drv = "/data/disk4/lyx_ICML/self_evolution_forgery/data/real_faces/1_row2_real.png"
+    print("=== LivePortrait (real) smoke ===")
+    op = LivePortraitOperator()
+    r = op.run(src_face_path=src, params={"driving_path": drv})
     print(f"  success={r.success} out={r.output_path} err={r.error} {r.duration_sec:.2f}s")
     print(f"\n=== Adv-Patch PGD smoke ===")
     op2 = AdvPatchPGDOperator()

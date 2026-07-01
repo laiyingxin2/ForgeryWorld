@@ -184,17 +184,56 @@ class MemoryHierarchy:
             return list(self._l4_skills.values())
         return [s for s in self._l4_skills.values() if family in s.spans_families]
 
+    @staticmethod
+    def _is_junk_doc(doc: str) -> bool:
+        """Reject supervisor refusals / empty docs from meta-skill mining."""
+        if not doc or len(doc.strip()) < 12:
+            return True
+        low = doc.lower()
+        refusal_markers = (
+            "i cannot fulfill", "i can't fulfill", "i am unable to", "i'm unable to",
+            "i cannot provide", "i can't provide", "i cannot assist", "i can't assist",
+            "i cannot help with", "from a defensive perspective",
+        )
+        return any(m in low for m in refusal_markers)
+
+    @staticmethod
+    def _is_junk_ngram(ngram: str) -> bool:
+        """Reject defender-catch-rate / metric-log phrases (e.g. 'defender caught
+        100 reenact', 'catch rate 0%') that are telemetry noise, not attack
+        strategy. These polluted L4 with vacuous 'cross-family patterns'."""
+        low = ngram.lower()
+        noise_tokens = ("caught", "catch", "defender", "bypass rate", "catch_rate",
+                        "confidence", "%", "seen", "n_traj", "real image", "fake image")
+        if any(t in low for t in noise_tokens):
+            return True
+        # mostly-digits phrase carries no transferable strategy
+        digit_chars = sum(c.isdigit() for c in low)
+        return digit_chars >= max(3, len(low.replace(" ", "")) // 2)
+
     def promote_to_meta_skill(self, family_skills: dict[str, str],
                                threshold_families: int = 2,
-                               round_id: int = 0) -> Optional[MetaSkill]:
+                               round_id: int = 0,
+                               verified_families: Optional[set] = None) -> Optional[MetaSkill]:
         """Given {family: skill_doc_text}, detect if N≥threshold families share
         a common pattern. Heuristic: shared 4-gram across docs. If yes, promote.
+
+        Fix ③: only mine families that have a REAL sandbox-verified bypass
+        (`verified_families`), drop refusal/empty docs, and filter out
+        defender-catch-rate / metric-log n-grams so L4 stops crystallizing
+        vacuous patterns like 'reenact=100%'.
         Returns the new MetaSkill or None."""
         from collections import Counter
-        if len(family_skills) < threshold_families:
+        # gate on real sandbox verification + drop junk docs
+        clean_skills = {
+            fam: doc for fam, doc in family_skills.items()
+            if not self._is_junk_doc(doc)
+            and (verified_families is None or fam in verified_families)
+        }
+        if len(clean_skills) < threshold_families:
             return None
         family_ngrams = {}
-        for fam, doc in family_skills.items():
+        for fam, doc in clean_skills.items():
             words = doc.lower().split()
             family_ngrams[fam] = set(
                 " ".join(words[i:i+4]) for i in range(max(0, len(words)-3))
@@ -203,6 +242,8 @@ class MemoryHierarchy:
         counter = Counter()
         for fam, ngs in family_ngrams.items():
             for n in ngs:
+                if self._is_junk_ngram(n):
+                    continue
                 counter[n] += 1
         candidates = [(n, c) for n, c in counter.items() if c >= threshold_families]
         if not candidates:
